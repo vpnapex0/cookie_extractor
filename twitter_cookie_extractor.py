@@ -16,9 +16,10 @@ logger = logging.getLogger(__name__)
 REDIS_URL = os.environ.get('REDIS_URL')
 
 # CRITICAL SECURITY NOTE:
-# Storing credentials in environment variables carries risk.
-# This script automates login; if credentials are compromised, your account is at risk.
-# The most secure method remains manually exporting cookies from your browser.
+# Storing credentials in environment variables carries significant risk.
+# If these credentials are ever compromised (e.g., due to a Render breach or misconfiguration),
+# your Twitter account could be at serious risk.
+# The most secure method for persistent authentication remains manually exporting cookies from your browser.
 TWITTER_USERNAME = os.environ.get('TWITTER_USERNAME')
 TWITTER_PASSWORD = os.environ.get('TWITTER_PASSWORD')
 
@@ -34,7 +35,7 @@ def get_redis_client():
             return None
         try:
             redis_client = redis.from_url(REDIS_URL, decode_responses=False)
-            redis_client.ping()
+            redis_client.ping() # Test connection
             logger.info("Successfully connected to Upstash Redis.")
         except Exception as e:
             logger.critical(f"Redis connection failed: {e}")
@@ -52,59 +53,65 @@ async def extract_twitter_cookies() -> str | None:
 
     logger.info("Starting headless browser for Twitter cookie extraction...")
     async with async_playwright() as p:
-        browser = None # Initialize browser to None
+        browser = None # Initialize browser to None outside try for finally block
         try:
-            # Launch Chromium in headless mode for Render
+            # Launch Chromium in headless mode for Render.
+            # --no-sandbox is often required in Docker/containerized environments.
             browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
             context = await browser.new_context()
             page = await context.new_page()
 
             logger.info("Navigating to Twitter login page...")
-            await page.goto("https://x.com/i/flow/login", wait_until='load', timeout=60000) # Use load for faster initial page load
+            # Increased timeout to 60 seconds (60000ms) for initial navigation
+            await page.goto("https://x.com/i/flow/login", wait_until='load', timeout=60000)
 
             # --- Twitter Login Flow (Highly Fragile & Subject to Change) ---
             # This part is the most likely to break. Selectors can change frequently.
-            # Expect CAPTCHAs or other verification steps to halt automation.
+            # Expect CAPTCHAs, phone/email verification steps, or other anti-bot challenges to halt automation.
 
             # Step 1: Enter Username/Email/Phone
             logger.info("Attempting to enter username...")
             # Wait for the input field to be visible and enabled
             await page.wait_for_selector('input[autocomplete="username"]', timeout=30000)
-            await page.fill('input[autocomplete="username"]', TWITTER_USERNAME)
+            # Use page.type with delay for more human-like typing
+            await page.type('input[autocomplete="username"]', TWITTER_USERNAME, delay=100) # 100ms delay per character
             await page.keyboard.press('Enter') # Simulate pressing Enter
 
-            # Wait for the next step (password input or phone/email verification)
-            # This might be tricky if Twitter asks for phone/email verification instead of password directly
+            # Step 2: Handle password input or potential verification prompts
             try:
                 logger.info("Waiting for password field or verification prompt...")
-                await page.wait_for_selector('input[name="password"]', timeout=15000) # Wait for password field
+                # Increased timeout for waiting for password field
+                await page.wait_for_selector('input[name="password"]', timeout=30000)
                 logger.info("Password field found. Entering password...")
-                await page.fill('input[name="password"]', TWITTER_PASSWORD)
+                # Use page.type with delay for more human-like typing
+                await page.type('input[name="password"]', TWITTER_PASSWORD, delay=100) # 100ms delay per character
                 await page.keyboard.press('Enter')
             except TimeoutError:
-                # If password field is not found, it might be a verification step
+                # If password field is not found, it might be a verification step or anti-bot block
                 logger.warning("Password field not found directly. Checking for verification steps or other prompts.")
-                # Add logic here to handle potential email/phone/username verification prompts
-                # This is extremely complex to automate. For simplicity, we'll assume failure.
-                # await page.screenshot(path="twitter_verification_screenshot.png") # For local debugging
-                logger.error("Automated login failed: Likely stuck on a verification step (e.g., phone/email/username confirmation). Manual intervention required or selectors outdated.")
+                # For robust debugging without logs, consider capturing screenshot/page content here
+                # await page.screenshot(path="/tmp/timeout_screenshot_password_stage.png")
+                # logger.error(f"Page content on password timeout: {await page.content()}")
+                logger.error("Automated login failed: Likely stuck on a verification step (e.g., phone/email/username confirmation, CAPTCHA, or anti-bot block). Manual intervention required or selectors outdated.")
                 return None # Indicate failure
 
             # Wait for successful login (e.g., redirect to home feed)
             logger.info("Waiting for post-login page...")
-            await page.wait_for_url("https://x.com/home", timeout=90000)
+            # Increased timeout for post-login navigation to 90 seconds (90000ms)
+            await page.wait_for_url("https://x.com/home", wait_until='load', timeout=90000)
             logger.info("Successfully logged into Twitter.")
 
             # --- Extract Cookies ---
             cookies = await context.cookies()
             netscape_cookies = ""
-            # Netscape cookie file header
+            # Netscape cookie file header format
             netscape_cookies += "# Netscape HTTP Cookie File\n"
             netscape_cookies += "# https://curl.haxx.se/docs/http-cookies.html\n"
             netscape_cookies += "# This file was generated by an automated service. Do not share.\n"
             
             for cookie in cookies:
-                # Domain, Include Subdomains, Path, Secure, Expiry (Unix timestamp), Name, Value
+                # Convert Playwright cookie dictionary to Netscape format string
+                # Example Playwright cookie: {'name': 'auth_token', 'value': '...', 'domain': '.x.com', 'path': '/', 'expires': 1726772710.875, 'httpOnly': True, 'secure': True, 'sameSite': 'Lax'}
                 include_subdomains = "TRUE" if cookie.get('domain', '').startswith('.') else "FALSE"
                 expiry = int(cookie.get('expires', 0)) if cookie.get('expires') else 0
                 secure = "TRUE" if cookie.get('secure') else "FALSE"
@@ -123,15 +130,14 @@ async def extract_twitter_cookies() -> str | None:
 
         except TimeoutError as e:
             logger.error(f"Playwright operation timed out: {e}")
-            if browser:
-                 await page.screenshot(path="/tmp/timeout_screenshot.png") # Capture screenshot for debugging
-                 logger.info("Screenshot saved to /tmp/timeout_screenshot.png (check Render logs for path).")
+            # The screenshot saving to /tmp/ might work, but you can't access it directly from Render logs.
+            # For local debugging, page.screenshot(path="timeout_screenshot.png") is useful.
             return None
         except Exception as e:
-            logger.error(f"An error occurred during cookie extraction: {e}", exc_info=True)
+            logger.error(f"An unexpected error occurred during cookie extraction: {e}", exc_info=True)
             return None
         finally:
-            if browser:
+            if browser: # Ensure browser is defined before trying to close
                 await browser.close()
                 logger.info("Browser closed.")
 
@@ -158,7 +164,7 @@ async def trigger_twitter_cookie_extraction():
                 logger.error("Redis client not available for storing cookies.")
                 raise HTTPException(status_code=500, detail="Redis connection failed.")
             
-            redis_key = "twitter_cookies_netscape"
+            redis_key = "twitter_cookies_netscape" # Key must match what your main bot uses
             r_client.set(redis_key, extracted_cookie_str.encode('utf-8'))
             logger.info(f"Successfully stored Twitter cookies in Redis under key: {redis_key}")
             return JSONResponse(status_code=200, content={"message": "Twitter cookies extracted and updated successfully!"})
