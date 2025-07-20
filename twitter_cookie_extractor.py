@@ -92,7 +92,7 @@ async def extract_twitter_cookies() -> str | None:
 
             # Wait for successful login (e.g., redirect to home feed)
             logger.info("Waiting for post-login page...")
-            await page.wait_for_url("https://x.com/home", timeout=30000)
+            await page.wait_for_url("https://x.com/home", timeout=90000)
             logger.info("Successfully logged into Twitter.")
 
             # --- Extract Cookies ---
